@@ -23,7 +23,7 @@ class SampleRateMonitor:
         self.sample_timestamps = deque()
         self.total_samples = 0
         self.invalid_lines = 0
-        self.start_time = perf_counter()
+        self.first_sample_time = None
 
     def process_line(self, line):
         """1行のCSVが6軸IMUデータとして有効ならサンプルとして数える。"""
@@ -38,8 +38,12 @@ class SampleRateMonitor:
             self.invalid_lines += 1
             return
 
+        now = perf_counter()
+        if self.first_sample_time is None:
+            self.first_sample_time = now
+
         self.total_samples += 1
-        self.sample_timestamps.append(perf_counter())
+        self.sample_timestamps.append(now)
 
     def _drop_old_samples(self, now):
         cutoff = now - self.window_seconds
@@ -55,7 +59,7 @@ class SampleRateMonitor:
             1 for timestamp in self.sample_timestamps if timestamp >= one_second_cutoff
         )
         ten_second_count = len(self.sample_timestamps)
-        elapsed = now - self.start_time
+        elapsed = now - self.first_sample_time if self.first_sample_time else 0.0
         average_hz = self.total_samples / elapsed if elapsed > 0 else 0.0
 
         return one_second_count, ten_second_count, elapsed, average_hz
