@@ -1,183 +1,217 @@
-# M5Stack Core2 BLE IMU 送受信システム
+# M5Stack Core2 6軸IMU 送受信システム
 
-M5Stack Core2 v1.3の加速度・ジャイロセンサーをBLE（Bluetooth Low Energy）で100Hzのサンプリングレートで送受信するシステムです。
+M5Stack Core2 v1.3 の加速度・ジャイロセンサーを 100Hz で読み取り、PC 側へ送信する Arduino / Python コードです。
 
-## 概要
+このリポジトリには、通信方式が異なる 2 種類の Arduino コードがあります。取得するデータ形式はどちらも同じで、1行あたり `accX,accY,accZ,gyrX,gyrY,gyrZ` の CSV です。
 
-### Arduino側（送信）
-- M5Stack Core2 v1.3のIMUセンサー（MPU6886）から加速度とジャイロデータを読み込み
-- 100Hzのサンプリングレート（10ms間隔）で取得
-- BLE通知経由でデータを送信
-- データ形式：`accX,accY,accZ,gyrX,gyrY,gyrZ\n`
+この README では、Bluetooth Low Energy は正式名称の `BLE` と表記します。メモや会話中で `BLT` と書いている場合も、ここでは BLE のこととして整理しています。
 
-### Python側（受信）
-- BLEクライアントとしてM5StackのBLEサーバーに接続
-- リアルタイムで加速度・ジャイロデータを受信
-- CSVファイルに記録
+## 対応コード
+
+| 通信方式 | Arduinoコード | Pythonコード | 受信方法 | 備考 |
+| --- | --- | --- | --- | --- |
+| BLE (Bluetooth Low Energy) | `6axes_m5/6axes_m5.ino` | `ble_imu_client.py` | BLE Notify | CSV保存に対応 |
+| BLE (Bluetooth Low Energy) | `6axes_m5/6axes_m5.ino` | `ble_sample_rate_monitor.py` | BLE Notify | 受信サンプリングレート確認用 |
+| Bluetooth Classic | `6axes_m5_bluetooth_classic/6axes_m5_bluetooth_classic.ino` | `btclassic_sample_rate_monitor.py` | SPP仮想シリアル / COMポート | 受信サンプリングレート確認用 |
+
+## BLE と Bluetooth Classic の違い
+
+### BLE (Bluetooth Low Energy)
+
+`6axes_m5/6axes_m5.ino` は BLE のサーバーとして動作し、IMU データを Notification で送信します。PC 側では `bleak` を使って BLE デバイスを探し、UUID を指定して通知を受信します。
+
+- デバイス名: `M5Stack-Core2-IMU`
+- サービスUUID: `12345678-1234-1234-1234-123456789012`
+- キャラクタリスティックUUID: `87654321-4321-4321-4321-210987654321`
+- COMポートとしては表示されません
+- 環境や接続状態によって、受信が不安定になることがありました
+
+BLE 側が不安定な場合は、`ble_sample_rate_monitor.py` で実際の受信レートを確認してください。受信が途切れる、100Hz 付近で安定しない、接続が切れる場合は Bluetooth Classic 版との比較を行います。
+
+### Bluetooth Classic
+
+`6axes_m5_bluetooth_classic/6axes_m5_bluetooth_classic.ino` は Bluetooth Classic SPP で動作します。PC 側ではペアリング後に仮想シリアルポートとして見えるため、COMポートを開いてデータを読みます。
+
+- デバイス名: `M5Stack-Core2-IMU`
+- 通信方式: Bluetooth Classic SPP
+- PC側では COMポート / シリアルポートとして扱います
+- `btclassic_sample_rate_monitor.py` はポート一覧を表示し、番号選択で接続します
+- Arduino 側は Bluetooth Classic と USB Serial の両方に同じCSVを出力します
+
+## データ形式
+
+Arduino から送信される1サンプルは次の形式です。
+
+```text
+accX,accY,accZ,gyrX,gyrY,gyrZ
+```
+
+例:
+
+```text
+0.12,9.81,-0.05,1.23,-0.45,0.78
+```
 
 ## セットアップ
 
 ### Arduino側
 
-1. **Arduino IDEのインストール**
-   - [Arduino IDE](https://www.arduino.cc/en/software)をインストール
+1. Arduino IDE をインストールします。
+2. Arduino IDE の `Preferences` -> `Additional Boards Manager URLs` に以下を追加します。
 
-2. **M5Stack Board Packageのインストール**
-   - Arduino IDE → Preferences → Additional Boards Manager URLs に以下を追加：
-     ```
-     https://m5stack.oss-cn-shenzhen.aliyuncs.com/resource/arduino/package_m5stack_index.json
-     ```
-   - Board Manager（Ctrl+Shift+B）で「m5stack」を検索・インストール
+```text
+https://m5stack.oss-cn-shenzhen.aliyuncs.com/resource/arduino/package_m5stack_index.json
+```
 
-3. **ライブラリのインストール**
-   - Arduino IDE → Library Manager（Ctrl+Shift+I）で以下をインストール：
-     - M5Core2
-     - BLEDevice
-     - BluetoothSerial
-   
-4. **ボード設定**
-   - Board: "M5Stack-Core2"
-   - Port: 接続しているUSBポート
+3. Board Manager で `m5stack` を検索してインストールします。
+4. Library Manager で `M5Core2` をインストールします。
+5. ボードは `M5Stack-Core2` を選択します。
+6. 使う通信方式に合わせてスケッチを開き、M5Stack Core2 にアップロードします。
 
-5. **スケッチのアップロード**
-   - `6axes_m5/6axes_m5.ino`をArduino IDEで開く
-   - 右上の「→」ボタンでアップロード
+BLE 版:
+
+```text
+6axes_m5/6axes_m5.ino
+```
+
+Bluetooth Classic 版:
+
+```text
+6axes_m5_bluetooth_classic/6axes_m5_bluetooth_classic.ino
+```
 
 ### Python側
 
-1. **Python 3.8以上のインストール**
+BLE 版を使う場合:
 
-2. **必要なパッケージのインストール**
-   ```bash
-   pip install bleak
-   ```
+```bash
+pip install bleak
+```
 
-3. **Bluetooth権限設定（Linuxの場合）**
-   ```bash
-   sudo setcap cap_net_raw,cap_net_admin+ep $(eval readlink -f `which python3`)
-   ```
+Bluetooth Classic 版を使う場合:
+
+```bash
+pip install pyserial
+```
 
 ## 使用方法
 
-### Arduino（M5Stack）側
-1. M5StackをUSBで接続
-2. Arduino IDEでスケッチをアップロード
-3. M5Stackの画面に「BLE IMU Server」が表示される
-4. クライアント接続待機中
+### BLEでCSV保存
 
-### Python側
+M5Stack に `6axes_m5/6axes_m5.ino` を書き込んでから実行します。
 
-基本的な使用方法：
 ```bash
-python3 ble_imu_client.py [出力ファイル名]
+python3 ble_imu_client.py
 ```
 
-例：
-```bash
-# デフォルト名で保存（imu_data_YYYYMMDD_HHMMSS.csv）
-python3 ble_imu_client.py
+出力ファイル名を指定する場合:
 
-# カスタムファイル名で保存
+```bash
 python3 ble_imu_client.py sensor_data.csv
 ```
 
-受信サンプリングレートの確認：
+デフォルトでは `imu_data_YYYYMMDD_HHMMSS.csv` の形式で保存されます。
+
+### BLEの受信サンプリングレート確認
+
 ```bash
 python3 ble_sample_rate_monitor.py
 ```
 
-この確認ツールはCSV保存を行わず、BLE通知で届いた有効なIMUデータ行だけを数えます。実行中は1秒ごとに、直近1秒間の受信サンプル数と直近10秒間の受信サンプル数を表示します。
+表示更新間隔を変える場合:
 
-表示更新間隔を変更する場合：
 ```bash
 python3 ble_sample_rate_monitor.py --interval 0.5
 ```
 
-デバイス名を指定する場合：
+デバイス名を指定する場合:
+
 ```bash
 python3 ble_sample_rate_monitor.py --device-name M5Stack-Core2-IMU
 ```
 
-### 出力例
+### Bluetooth Classicの受信サンプリングレート確認
 
-コンソール出力：
-```
-Scanning for device: M5Stack-Core2-IMU...
-Found device: M5Stack-Core2-IMU (xx:xx:xx:xx:xx:xx)
-Connected to M5Stack-Core2-IMU
-Listening for IMU data... (Press Ctrl+C to stop)
-----------------------------------------------------------------------------------------------------
-[1] 2024-01-15T10:30:45.123456 | Acc: (  0.12,   9.81,  -0.05) | Gyr: (   1.23,  -0.45,   0.78)
-[2] 2024-01-15T10:30:45.133456 | Acc: (  0.13,   9.82,  -0.04) | Gyr: (   1.22,  -0.46,   0.79)
-...
+M5Stack に `6axes_m5_bluetooth_classic/6axes_m5_bluetooth_classic.ino` を書き込み、PC 側で `M5Stack-Core2-IMU` とペアリングしてから実行します。
+
+```bash
+python3 btclassic_sample_rate_monitor.py
 ```
 
-CSV出力例（imu_data_YYYYMMDD_HHMMSS.csv）：
-```
-Timestamp,AccX,AccY,AccZ,GyrX,GyrY,GyrZ
-2024-01-15T10:30:45.123456,0.12,9.81,-0.05,1.23,-0.45,0.78
-2024-01-15T10:30:45.133456,0.13,9.82,-0.04,1.22,-0.46,0.79
-...
+実行すると利用可能なシリアルポートが一覧表示されます。使用する COMポート / シリアルポートの番号を入力してください。
+
+ポートを直接指定する場合:
+
+```bash
+python3 btclassic_sample_rate_monitor.py --port COM5
 ```
 
-サンプリングレート確認ツールの出力例：
+macOS / Linux の例:
+
+```bash
+python3 btclassic_sample_rate_monitor.py --port /dev/tty.M5Stack-Core2-IMU
 ```
-Scanning for device: M5Stack-Core2-IMU...
-Found device: M5Stack-Core2-IMU (xx:xx:xx:xx:xx:xx)
-Connected to M5Stack-Core2-IMU
-受信サンプリングレートを確認中... (Ctrl+Cで停止)
---------------------------------------------------------------------------------------------------------------
+
+## サンプリングレート確認ツールの出力例
+
+```text
 [10:30:46] 1秒:  100 samples ( 100.0 Hz) | 直近10秒:   100 samples ( 100.0 Hz) | 合計:     100 | 平均:  100.0 Hz | 経過:    1.0s | 無効行: 0
 [10:30:55] 1秒:  100 samples ( 100.0 Hz) | 直近10秒:  1000 samples ( 100.0 Hz) | 合計:    1000 | 平均:  100.0 Hz | 経過:   10.0s | 無効行: 0
 ```
 
-## BLE通信仕様
-
-- **サービスUUID**: `12345678-1234-1234-1234-123456789012`
-- **キャラクタリスティックUUID**: `87654321-4321-4321-4321-210987654321`
-- **通信方式**: Notification（サーバーから通知）
-- **サンプリングレート**: 100Hz（10ms間隔）
-
 ## トラブルシューティング
 
-### Pythonでデバイスが見つからない場合
+### BLEでデバイスが見つからない場合
 
-**macOS:**
+- M5Stack の画面に `BLE IMU Server` が表示されているか確認します。
+- PC の Bluetooth を一度オフ/オンします。
+- `ble_sample_rate_monitor.py --device-name M5Stack-Core2-IMU` でデバイス名が合っているか確認します。
+- BLE は COMポートには出てこないため、シリアルモニタからは読めません。
+
+### BLEの受信が不安定な場合
+
+- `ble_sample_rate_monitor.py` で 1秒ごとの受信サンプル数を確認します。
+- 100Hz 付近で安定しない場合は、Bluetooth Classic 版の `btclassic_sample_rate_monitor.py` でも同じ条件で確認します。
+- PC の Bluetooth アダプタ、OS、周囲の無線環境によって安定性が変わることがあります。
+
+### Bluetooth Classicでポートが出ない場合
+
+- OS の Bluetooth 設定で `M5Stack-Core2-IMU` とペアリングします。
+- ペアリング後に仮想 COMポート / シリアルポートが作成されているか確認します。
+- Windows ではデバイスマネージャーの `ポート (COM と LPT)` を確認します。
+- macOS / Linux では `/dev/tty.*` や `/dev/rfcomm*` を確認します。
+
+### Pythonで依存ライブラリがないと言われる場合
+
+BLE:
+
 ```bash
-# Bluetoothの再起動
-sudo launchctl stop com.apple.blued
-sudo launchctl start com.apple.blued
+pip install bleak
 ```
 
-**Linux:**
-```bash
-# bluetoothctlで確認
-bluetoothctl
-scan on
-```
+Bluetooth Classic:
 
-**Windows:**
-- Bluetoothデバイスの接続確認
-- ドライバの更新
-
-### Python実行時にPermission Deniedが出る場合（Linux）
 ```bash
-sudo setcap cap_net_raw,cap_net_admin+ep /usr/bin/python3
+pip install pyserial
 ```
 
 ### M5Stack側でIMUが初期化されない場合
-- M5CoreのバージョンがCore2に対応しているか確認
-- I2Cアドレスが正しいか確認（MPU6886は0x68）
+
+- M5Core2 ライブラリが Core2 に対応しているか確認します。
+- Arduino IDE のボード設定が `M5Stack-Core2` になっているか確認します。
+- USB接続後に再起動してから再度アップロードします。
 
 ## 注意事項
 
-- **クロック精度**: Pythonのタイムスタンプはクライアント側のシステム時刻です
-- **データレート**: BLE MTU（最大転送ユニット）による制限あり
-- **電力消費**: BLE送信により電力消費が増加します
+- Python 側のタイムスタンプや受信レートは、PC 側で受信できたタイミングをもとにしています。
+- Arduino 側は 10ms 間隔でサンプリングする実装ですが、無線通信やOS側の処理によりPC側の受信間隔は揺れることがあります。
+- BLE 版と Bluetooth Classic 版で、送信する CSV の列順は同じです。
+- この環境では Arduino のコンパイル確認は未実施です。
 
 ## 参考資料
 
 - [M5Stack Core2 ドキュメント](https://docs.m5stack.com/en/core/core2)
 - [ESP32 BLE Arduino](https://github.com/espressif/arduino-esp32/blob/master/libraries/BLE/)
+- [Arduino ESP32 BluetoothSerial](https://github.com/espressif/arduino-esp32/tree/master/libraries/BluetoothSerial)
 - [Bleak ドキュメント](https://bleak.readthedocs.io/)
-# 6-axes_m5stack_core2
+- [pySerial ドキュメント](https://pyserial.readthedocs.io/)
