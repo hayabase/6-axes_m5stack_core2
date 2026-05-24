@@ -181,6 +181,12 @@ python3 btclassic_sample_rate_monitor.py --port /dev/tty.M5Stack-Core2-IMU
 - Windows ではデバイスマネージャーの `ポート (COM と LPT)` を確認します。
 - macOS / Linux では `/dev/tty.*` や `/dev/rfcomm*` を確認します。
 
+### WindowsのBluetooth Classicで受信が欠落する場合
+
+Bluetooth Classic は Windows では COMポートとして扱われるため、受信データが欠落する場合は COMポート側のバッファ設定も確認します。Windows のデバイスマネージャーで対象の COMポートを開き、詳細設定から受信バッファを小さめに設定して試してください。
+
+参考: [WindowsのRS-232Cシリアル通信で受信データに欠落が発生する](https://gabekore.org/windows-rs232c-deficit-recv-data)
+
 ### Pythonで依存ライブラリがないと言われる場合
 
 BLE:
@@ -215,3 +221,4 @@ pip install pyserial
 - [Arduino ESP32 BluetoothSerial](https://github.com/espressif/arduino-esp32/tree/master/libraries/BluetoothSerial)
 - [Bleak ドキュメント](https://bleak.readthedocs.io/)
 - [pySerial ドキュメント](https://pyserial.readthedocs.io/)
+- [WindowsのRS-232Cシリアル通信で受信データに欠落が発生する](https://gabekore.org/windows-rs232c-deficit-recv-data)
