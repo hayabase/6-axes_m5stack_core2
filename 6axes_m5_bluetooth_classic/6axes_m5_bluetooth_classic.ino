@@ -9,7 +9,8 @@
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled! Please enable it in the ESP32 settings.
 #endif
-const char* BT_NAME = "M5Stack-Core2-IMU";
+const char* BT_NAME_PREFIX = "M5Stack-IMU";
+char btName[32];
 BluetoothSerial SerialBT;
 // サンプリング設定
 unsigned long lastSampleTime = 0;
@@ -23,7 +24,7 @@ void drawStatus(bool connected) {
   M5.Display.setCursor(0, 0);
   M5.Display.println("BT Classic IMU");
   M5.Display.print("Name: ");
-  M5.Display.println(BT_NAME);
+  M5.Display.println(btName);
   M5.Display.println();
   if (connected) {
     M5.Display.setTextColor(GREEN);
@@ -65,8 +66,12 @@ void setup() {
     }
   }
   Serial.println("[IMU] IMU enabled.");
+
+  uint64_t chipId = ESP.getEfuseMac();
+  snprintf(btName, sizeof(btName), "%s-%04X", BT_NAME_PREFIX, (uint16_t)(chipId & 0xFFFF));
+
   // Bluetooth Classic SPP 開始
-  if (!SerialBT.begin(BT_NAME)) {
+  if (!SerialBT.begin(btName)) {
     Serial.println("[BT] Bluetooth Classic init failed");
     M5.Display.fillScreen(BLACK);
     M5.Display.setTextColor(RED);
@@ -78,7 +83,7 @@ void setup() {
     }
   }
   Serial.print("[BT] Bluetooth Classic started. Device name: ");
-  Serial.println(BT_NAME);
+  Serial.println(btName);
   Serial.println("[BT] Pair/connect from PC or smartphone via Bluetooth SPP.");
   Serial.println("accX,accY,accZ,gyrX,gyrY,gyrZ");
   drawStatus(false);
