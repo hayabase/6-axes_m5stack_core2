@@ -42,14 +42,19 @@ class SampleRateMonitor:
         self._process_line(line)
 
     def _process_line(self, line):
-        """1行のCSVが6軸IMUデータとして有効ならサンプルとして数える。"""
+        """6値または index,timeMs付き8値のIMU CSVをサンプルとして数える。"""
         values = line.strip().split(",")
-        if len(values) != 6:
+        if len(values) not in (6, 8):
             self.invalid_lines += 1
             return
 
         try:
-            [float(value) for value in values]
+            if len(values) == 8:
+                int(values[0])
+                float(values[1])
+                [float(value) for value in values[2:]]
+            else:
+                [float(value) for value in values]
         except ValueError:
             self.invalid_lines += 1
             return
@@ -177,7 +182,7 @@ def print_no_sample_diagnostics(port, monitor):
     if monitor.raw_bytes == 0:
         print(
             "[diagnostic] bytes=0 なので、Pythonはポートを開けていますが、"
-            "M5Stack側のBluetooth Classic SPP接続は成立していない可能性が高いです。",
+            "現時点ではM5Stack側のBluetooth Classic SPP接続がまだ成立していません。",
             file=sys.stderr,
             flush=True,
         )

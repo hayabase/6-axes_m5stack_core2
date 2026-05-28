@@ -30,6 +30,8 @@ class SampleCounter:
         self.raw_bytes = 0
         self.last_line_preview = ""
         self.sample_timestamps = deque()
+        self.source_samples = deque()
+        self.source_rows = 0
 
     def process_raw_line(self, raw_line):
         line = raw_line.decode("utf-8", errors="replace").strip()
@@ -44,14 +46,21 @@ class SampleCounter:
         self._process_line(line)
 
     def _process_line(self, line):
-        """1行のCSVが6軸IMUデータとして有効ならサンプルとして数える。"""
+        """6値または index,timeMs付き8値のIMU CSVをサンプルとして数える。"""
         values = line.strip().split(",")
-        if len(values) != 6:
+        if len(values) not in (6, 8):
             self._add_invalid_line()
             return
 
         try:
-            [float(value) for value in values]
+            if len(values) == 8:
+                sample_index = int(values[0])
+                sample_time_ms = float(values[1])
+                [float(value) for value in values[2:]]
+            else:
+                sample_index = None
+                sample_time_ms = None
+                [float(value) for value in values]
         except ValueError:
             self._add_invalid_line()
             return
@@ -59,6 +68,9 @@ class SampleCounter:
         with self._lock:
             self.total_samples += 1
             self.sample_timestamps.append(perf_counter())
+            if sample_index is not None and sample_time_ms is not None:
+                self.source_rows += 1
+                self.source_samples.append((sample_index, sample_time_ms))
 
     def _add_invalid_line(self):
         with self._lock:
@@ -67,11 +79,27 @@ class SampleCounter:
     def snapshot(self, now=None, rate_window_seconds=None):
         with self._lock:
             window_count = None
+            source_hz = None
             if now is not None and rate_window_seconds is not None:
                 cutoff = now - rate_window_seconds
                 while self.sample_timestamps and self.sample_timestamps[0] < cutoff:
                     self.sample_timestamps.popleft()
                 window_count = len(self.sample_timestamps)
+
+                if self.source_samples:
+                    latest_source_time_ms = self.source_samples[-1][1]
+                    source_cutoff_ms = latest_source_time_ms - (rate_window_seconds * 1000.0)
+                    while (
+                        len(self.source_samples) > 1
+                        and self.source_samples[0][1] < source_cutoff_ms
+                    ):
+                        self.source_samples.popleft()
+
+                    first_index, first_time_ms = self.source_samples[0]
+                    last_index, last_time_ms = self.source_samples[-1]
+                    source_elapsed_seconds = (last_time_ms - first_time_ms) / 1000.0
+                    if source_elapsed_seconds > 0:
+                        source_hz = (last_index - first_index) / source_elapsed_seconds
 
             return {
                 "total_samples": self.total_samples,
@@ -80,6 +108,8 @@ class SampleCounter:
                 "raw_bytes": self.raw_bytes,
                 "last_line_preview": self.last_line_preview,
                 "window_count": window_count,
+                "source_rows": self.source_rows,
+                "source_hz": source_hz,
             }
 
 
@@ -204,8 +234,13 @@ def read_serial_lines(imu_name, serial_port, counter, stop_event, errors):
             sleep(0.001)
 
 
-def print_stream_header(imu_count, rate_window_seconds):
-    if rate_window_seconds <= DEFAULT_RATE_WINDOW_SECONDS:
+def print_stream_header(imu_count, rate_window_seconds, source_rate):
+    if source_rate:
+        window_label = f"{rate_window_seconds:g}s"
+        columns = [
+            f"IMU{index}_source_hz_{window_label}" for index in range(1, imu_count + 1)
+        ]
+    elif rate_window_seconds <= DEFAULT_RATE_WINDOW_SECONDS:
         columns = [f"IMU{index}_samples_per_sec" for index in range(1, imu_count + 1)]
     else:
         window_label = f"{rate_window_seconds:g}s"
@@ -240,7 +275,7 @@ def print_no_sample_diagnostics(port_labels, snapshots):
     if all(snapshot["raw_bytes"] == 0 for snapshot in snapshots):
         print(
             "[diagnostic] bytes=0 なので、Pythonはポートを開けていますが、"
-            "M5Stack側のBluetooth Classic SPP接続は成立していない可能性が高いです。",
+            "現時点ではM5Stack側のBluetooth Classic SPP接続がまだ成立していません。",
             file=sys.stderr,
             flush=True,
         )
@@ -284,6 +319,7 @@ def monitor_multi_sample_rate(
     timeout_seconds,
     diagnostics_seconds,
     rate_window_seconds,
+    source_rate,
     use_tty,
 ):
     serial, list_ports = import_serial_modules()
@@ -353,13 +389,19 @@ def monitor_multi_sample_rate(
             thread.start()
             threads.append(thread)
 
-        print("1秒ごとの受信サンプル数を出力します。停止: Ctrl+C")
-        if rate_window_seconds > DEFAULT_RATE_WINDOW_SECONDS:
+        if source_rate:
             print(
-                f"直近{rate_window_seconds:g}秒の移動平均Hzを出力します。",
+                f"直近{rate_window_seconds:g}秒のM5側時刻ベースHzを出力します。",
                 file=sys.stderr,
             )
-        print_stream_header(len(counters), rate_window_seconds)
+        else:
+            print("1秒ごとの受信サンプル数を出力します。停止: Ctrl+C")
+            if rate_window_seconds > DEFAULT_RATE_WINDOW_SECONDS:
+                print(
+                    f"直近{rate_window_seconds:g}秒の移動平均Hzを出力します。",
+                    file=sys.stderr,
+                )
+        print_stream_header(len(counters), rate_window_seconds, source_rate)
 
         last_totals = [0 for _ in counters]
         next_print_time = perf_counter() + interval_seconds
@@ -379,7 +421,14 @@ def monitor_multi_sample_rate(
                 for counter in counters
             ]
             totals = [snapshot["total_samples"] for snapshot in snapshots]
-            if rate_window_seconds <= DEFAULT_RATE_WINDOW_SECONDS:
+            if source_rate:
+                output_values = [
+                    f"{snapshot['source_hz']:.2f}"
+                    if snapshot["source_hz"] is not None
+                    else "nan"
+                    for snapshot in snapshots
+                ]
+            elif rate_window_seconds <= DEFAULT_RATE_WINDOW_SECONDS:
                 output_values = [
                     str(total - last_total)
                     for total, last_total in zip(totals, last_totals)
@@ -395,6 +444,18 @@ def monitor_multi_sample_rate(
 
             if all(total == 0 for total in totals) and now >= next_diagnostics_time:
                 print_no_sample_diagnostics(ports, snapshots)
+                next_diagnostics_time = now + diagnostics_seconds
+            elif (
+                source_rate
+                and now >= next_diagnostics_time
+                and any(snapshot["source_rows"] == 0 for snapshot in snapshots)
+            ):
+                print(
+                    "[diagnostic] --source-rate には index,timeMs 付きの8列CSVが必要です。"
+                    "更新済みArduinoスケッチを書き込んでください。",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 next_diagnostics_time = now + diagnostics_seconds
 
             if errors:
@@ -431,7 +492,8 @@ def monitor_multi_sample_rate(
                     f"IMU{index}: total={snapshot['total_samples']}, "
                     f"lines={snapshot['received_lines']}, "
                     f"bytes={snapshot['raw_bytes']}, "
-                    f"invalid_lines={snapshot['invalid_lines']}"
+                    f"invalid_lines={snapshot['invalid_lines']}, "
+                    f"source_rows={snapshot['source_rows']}"
                 )
             print("Summary: " + " | ".join(summaries))
 
@@ -489,6 +551,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--source-rate",
+        action="store_true",
+        help=(
+            "index,timeMs付き8列CSVから、M5側時刻ベースのHzを表示します。"
+            "Bluetooth受信バーストの影響を受けにくい確認用です。"
+        ),
+    )
+    parser.add_argument(
         "--use-tty",
         action="store_true",
         help=(
@@ -509,6 +579,7 @@ def main():
             timeout_seconds=args.timeout,
             diagnostics_seconds=args.diagnostics,
             rate_window_seconds=args.rate_window,
+            source_rate=args.source_rate,
             use_tty=args.use_tty,
         )
     except KeyboardInterrupt:

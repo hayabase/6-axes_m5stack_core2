@@ -15,6 +15,7 @@ BluetoothSerial SerialBT;
 // サンプリング設定
 unsigned long lastSampleTime = 0;
 const unsigned long SAMPLE_INTERVAL = 10;  // 100Hz = 10ms
+uint32_t sampleIndex = 0;
 bool oldClientConnected = false;
 // 表示更新用
 void drawStatus(bool connected) {
@@ -36,6 +37,7 @@ void drawStatus(bool connected) {
   M5.Display.setTextColor(WHITE);
   M5.Display.println();
   M5.Display.println("Format:");
+  M5.Display.println("index,timeMs,");
   M5.Display.println("accX,accY,accZ,");
   M5.Display.println("gyrX,gyrY,gyrZ");
 }
@@ -85,7 +87,7 @@ void setup() {
   Serial.print("[BT] Bluetooth Classic started. Device name: ");
   Serial.println(btName);
   Serial.println("[BT] Pair/connect from PC or smartphone via Bluetooth SPP.");
-  Serial.println("accX,accY,accZ,gyrX,gyrY,gyrZ");
+  Serial.println("index,timeMs,accX,accY,accZ,gyrX,gyrY,gyrZ");
   drawStatus(false);
   lastSampleTime = millis();
 }
@@ -98,7 +100,10 @@ void loop() {
   }
   const unsigned long currentTime = millis();
   if (currentTime - lastSampleTime >= SAMPLE_INTERVAL) {
-    lastSampleTime = currentTime;
+    lastSampleTime += SAMPLE_INTERVAL;
+    if (currentTime - lastSampleTime >= SAMPLE_INTERVAL) {
+      lastSampleTime = currentTime;
+    }
     // IMUデータを更新できたときだけ読む
     if (M5.Imu.update()) {
       auto imuData = M5.Imu.getImuData();
@@ -108,12 +113,15 @@ void loop() {
       float gyrX = imuData.gyro.x;
       float gyrY = imuData.gyro.y;
       float gyrZ = imuData.gyro.z;
-      char dataBuffer[128];
+      char dataBuffer[160];
       // 小数4桁で出力
       // 加速度: g 単位
       // 角速度: deg/s 単位
+      sampleIndex++;
       snprintf(dataBuffer, sizeof(dataBuffer),
-               "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+               "%lu,%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+               (unsigned long)sampleIndex,
+               (unsigned long)currentTime,
                accX, accY, accZ, gyrX, gyrY, gyrZ);
       // Bluetooth接続中ならBluetoothにも送信
       if (clientConnected) {
