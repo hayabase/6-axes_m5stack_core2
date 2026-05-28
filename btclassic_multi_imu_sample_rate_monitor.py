@@ -10,6 +10,7 @@ import argparse
 import os
 import sys
 import threading
+from collections import deque
 from time import perf_counter, sleep
 
 
@@ -17,6 +18,7 @@ DEFAULT_BAUDRATE = 115200
 DEFAULT_INTERVAL_SECONDS = 1.0
 DEFAULT_TIMEOUT_SECONDS = 0.1
 DEFAULT_DIAGNOSTICS_SECONDS = 5.0
+DEFAULT_RATE_WINDOW_SECONDS = 1.0
 
 
 class SampleCounter:
@@ -27,6 +29,7 @@ class SampleCounter:
         self.received_lines = 0
         self.raw_bytes = 0
         self.last_line_preview = ""
+        self.sample_timestamps = deque()
 
     def process_raw_line(self, raw_line):
         line = raw_line.decode("utf-8", errors="replace").strip()
@@ -55,19 +58,28 @@ class SampleCounter:
 
         with self._lock:
             self.total_samples += 1
+            self.sample_timestamps.append(perf_counter())
 
     def _add_invalid_line(self):
         with self._lock:
             self.invalid_lines += 1
 
-    def snapshot(self):
+    def snapshot(self, now=None, rate_window_seconds=None):
         with self._lock:
+            window_count = None
+            if now is not None and rate_window_seconds is not None:
+                cutoff = now - rate_window_seconds
+                while self.sample_timestamps and self.sample_timestamps[0] < cutoff:
+                    self.sample_timestamps.popleft()
+                window_count = len(self.sample_timestamps)
+
             return {
                 "total_samples": self.total_samples,
                 "invalid_lines": self.invalid_lines,
                 "received_lines": self.received_lines,
                 "raw_bytes": self.raw_bytes,
                 "last_line_preview": self.last_line_preview,
+                "window_count": window_count,
             }
 
 
@@ -192,8 +204,14 @@ def read_serial_lines(imu_name, serial_port, counter, stop_event, errors):
             sleep(0.001)
 
 
-def print_stream_header(imu_count):
-    columns = [f"IMU{index}_samples_per_sec" for index in range(1, imu_count + 1)]
+def print_stream_header(imu_count, rate_window_seconds):
+    if rate_window_seconds <= DEFAULT_RATE_WINDOW_SECONDS:
+        columns = [f"IMU{index}_samples_per_sec" for index in range(1, imu_count + 1)]
+    else:
+        window_label = f"{rate_window_seconds:g}s"
+        columns = [
+            f"IMU{index}_rolling_hz_{window_label}" for index in range(1, imu_count + 1)
+        ]
     print(",".join(columns), flush=True)
 
 
@@ -265,6 +283,7 @@ def monitor_multi_sample_rate(
     interval_seconds,
     timeout_seconds,
     diagnostics_seconds,
+    rate_window_seconds,
     use_tty,
 ):
     serial, list_ports = import_serial_modules()
@@ -277,6 +296,10 @@ def monitor_multi_sample_rate(
 
     if diagnostics_seconds <= 0:
         print("診断表示間隔は0より大きい値を指定してください。")
+        return 1
+
+    if rate_window_seconds <= 0:
+        print("レート計算窓は0より大きい値を指定してください。")
         return 1
 
     if ports is None:
@@ -331,7 +354,12 @@ def monitor_multi_sample_rate(
             threads.append(thread)
 
         print("1秒ごとの受信サンプル数を出力します。停止: Ctrl+C")
-        print_stream_header(len(counters))
+        if rate_window_seconds > DEFAULT_RATE_WINDOW_SECONDS:
+            print(
+                f"直近{rate_window_seconds:g}秒の移動平均Hzを出力します。",
+                file=sys.stderr,
+            )
+        print_stream_header(len(counters), rate_window_seconds)
 
         last_totals = [0 for _ in counters]
         next_print_time = perf_counter() + interval_seconds
@@ -343,13 +371,25 @@ def monitor_multi_sample_rate(
                 sleep(min(0.01, next_print_time - now))
                 continue
 
-            snapshots = [counter.snapshot() for counter in counters]
-            totals = [snapshot["total_samples"] for snapshot in snapshots]
-            sample_counts = [
-                total - last_total
-                for total, last_total in zip(totals, last_totals)
+            snapshots = [
+                counter.snapshot(
+                    now=now,
+                    rate_window_seconds=rate_window_seconds,
+                )
+                for counter in counters
             ]
-            print(",".join(str(count) for count in sample_counts), flush=True)
+            totals = [snapshot["total_samples"] for snapshot in snapshots]
+            if rate_window_seconds <= DEFAULT_RATE_WINDOW_SECONDS:
+                output_values = [
+                    str(total - last_total)
+                    for total, last_total in zip(totals, last_totals)
+                ]
+            else:
+                output_values = [
+                    f"{snapshot['window_count'] / rate_window_seconds:.1f}"
+                    for snapshot in snapshots
+                ]
+            print(",".join(output_values), flush=True)
             last_totals = totals
             next_print_time += interval_seconds
 
@@ -439,6 +479,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--rate-window",
+        type=float,
+        default=DEFAULT_RATE_WINDOW_SECONDS,
+        help=(
+            "レート計算窓（秒）。1.0なら従来どおり直近1秒のサンプル数、"
+            "5や10ならBluetooth受信バーストをならした移動平均Hzを表示します。"
+            f"デフォルト: {DEFAULT_RATE_WINDOW_SECONDS}"
+        ),
+    )
+    parser.add_argument(
         "--use-tty",
         action="store_true",
         help=(
@@ -450,15 +500,20 @@ def parse_args():
 
 
 def main():
-    args = parse_args()
-    return monitor_multi_sample_rate(
-        ports=args.ports,
-        baudrate=args.baudrate,
-        interval_seconds=args.interval,
-        timeout_seconds=args.timeout,
-        diagnostics_seconds=args.diagnostics,
-        use_tty=args.use_tty,
-    )
+    try:
+        args = parse_args()
+        return monitor_multi_sample_rate(
+            ports=args.ports,
+            baudrate=args.baudrate,
+            interval_seconds=args.interval,
+            timeout_seconds=args.timeout,
+            diagnostics_seconds=args.diagnostics,
+            rate_window_seconds=args.rate_window,
+            use_tty=args.use_tty,
+        )
+    except KeyboardInterrupt:
+        print("\nStopping...")
+        return 0
 
 
 if __name__ == "__main__":

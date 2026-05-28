@@ -178,6 +178,18 @@ IMU1_samples_per_sec,IMU2_samples_per_sec
 99,100
 ```
 
+1秒ごとの生の受信数は、Bluetooth Classic SPP とOS側のバッファリングで `80 -> 120` のように揺れることがあります。平均として100Hz付近かを見たい場合は、直近5秒または10秒の移動平均Hzを表示します。
+
+```bash
+python3 btclassic_multi_imu_sample_rate_monitor.py --rate-window 10
+```
+
+```text
+IMU1_rolling_hz_10s,IMU2_rolling_hz_10s
+99.8,100.1
+100.0,99.9
+```
+
 `0,0` が続き、M5Stack側の表示が `Waiting...` のままなら、Pythonがローカルのシリアルポートを開けているだけで、Bluetooth Classic SPP接続は成立していません。古い同名ペアリングを削除し、M5Stack画面に表示された固有名でペアリングし直してください。
 
 更新後もmacOSのポート一覧に `M5Stack-Core2-IMU`, `M5Stack-Core2-IMU_1`, `M5Stack-Core2-IMU_2` だけが出ている場合は、古いペアリング情報を見ています。`M5Stack-IMU-XXXX` の名前が見える状態まで、OS側のペアリング削除と再ペアリングを行ってください。
