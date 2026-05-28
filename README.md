@@ -57,6 +57,8 @@ index,timeMs,accX,accY,accZ,gyrX,gyrY,gyrZ
 
 `index` はM5側のサンプル番号、`timeMs` はM5側の `millis()` 時刻です。Bluetooth受信タイミングの揺れと、M5側の生成レートを分けて確認するために使います。
 
+Bluetooth Classic 版は、Bluetooth送信待ちでIMU取得が止まりにくいように、IMU取得を別タスクで行い、サンプルを小さなリングバッファに入れてから送信します。USB Serialへの常時出力は負荷を減らすためデフォルトOFFです。USB Serialにも同じCSVを出したい場合は、Arduinoコード内の `SEND_USB_SERIAL` を `true` に変更してください。
+
 ## セットアップ
 
 ### Arduino側
@@ -192,7 +194,7 @@ IMU1_rolling_hz_10s,IMU2_rolling_hz_10s
 100.0,99.9
 ```
 
-Bluetoothの受信バーストを避けてM5側の生成レートを見たい場合は、更新済みArduinoスケッチを書き込んだ上で `--source-rate` を使います。
+Bluetoothの受信バーストを避けてM5側の生成レートを見たい場合は、更新済みArduinoスケッチを書き込んだ上で `--source-rate` を使います。複数台接続で見るべき基本値はこちらです。
 
 ```bash
 python3 btclassic_multi_imu_sample_rate_monitor.py --source-rate --rate-window 10

@@ -9,14 +9,145 @@
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled! Please enable it in the ESP32 settings.
 #endif
-const char* BT_NAME_PREFIX = "M5Stack-IMU";
+const char* BT_NAME_PREFIX = "M5Stack-IMU_2";
 char btName[32];
 BluetoothSerial SerialBT;
 // サンプリング設定
-unsigned long lastSampleTime = 0;
 const unsigned long SAMPLE_INTERVAL = 10;  // 100Hz = 10ms
 uint32_t sampleIndex = 0;
 bool oldClientConnected = false;
+const bool SEND_USB_SERIAL = false;
+const size_t SAMPLE_BUFFER_SIZE = 128;
+struct ImuSample {
+  uint32_t index;
+  uint32_t timeMs;
+  float accX;
+  float accY;
+  float accZ;
+  float gyrX;
+  float gyrY;
+  float gyrZ;
+};
+ImuSample sampleBuffer[SAMPLE_BUFFER_SIZE];
+size_t sampleReadIndex = 0;
+size_t sampleWriteIndex = 0;
+size_t bufferedSamples = 0;
+uint32_t droppedBufferedSamples = 0;
+portMUX_TYPE sampleBufferMux = portMUX_INITIALIZER_UNLOCKED;
+
+void clearSampleBuffer() {
+  portENTER_CRITICAL(&sampleBufferMux);
+  sampleReadIndex = 0;
+  sampleWriteIndex = 0;
+  bufferedSamples = 0;
+  portEXIT_CRITICAL(&sampleBufferMux);
+}
+
+void pushSample(const ImuSample& sample) {
+  portENTER_CRITICAL(&sampleBufferMux);
+  if (bufferedSamples >= SAMPLE_BUFFER_SIZE) {
+    sampleReadIndex = (sampleReadIndex + 1) % SAMPLE_BUFFER_SIZE;
+    bufferedSamples--;
+    droppedBufferedSamples++;
+  }
+
+  sampleBuffer[sampleWriteIndex] = sample;
+  sampleWriteIndex = (sampleWriteIndex + 1) % SAMPLE_BUFFER_SIZE;
+  bufferedSamples++;
+  portEXIT_CRITICAL(&sampleBufferMux);
+}
+
+bool popSample(ImuSample* sample) {
+  bool hasSample = false;
+  portENTER_CRITICAL(&sampleBufferMux);
+  if (bufferedSamples > 0) {
+    *sample = sampleBuffer[sampleReadIndex];
+    sampleReadIndex = (sampleReadIndex + 1) % SAMPLE_BUFFER_SIZE;
+    bufferedSamples--;
+    hasSample = true;
+  }
+  portEXIT_CRITICAL(&sampleBufferMux);
+  return hasSample;
+}
+
+int formatSampleLine(const ImuSample& sample, char* dataBuffer, size_t dataBufferSize) {
+  return snprintf(dataBuffer, dataBufferSize,
+                  "%lu,%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+                  (unsigned long)sample.index,
+                  (unsigned long)sample.timeMs,
+                  sample.accX, sample.accY, sample.accZ,
+                  sample.gyrX, sample.gyrY, sample.gyrZ);
+}
+
+void transmitBufferedSamples(bool clientConnected) {
+  char dataBuffer[160];
+
+  while (true) {
+    ImuSample sample;
+    if (!popSample(&sample)) {
+      break;
+    }
+
+    const int lineLength = formatSampleLine(sample, dataBuffer, sizeof(dataBuffer));
+    if (lineLength <= 0 || lineLength >= (int)sizeof(dataBuffer)) {
+      droppedBufferedSamples++;
+      continue;
+    }
+
+    bool sent = false;
+    if (clientConnected) {
+      sent = (SerialBT.write((const uint8_t*)dataBuffer, lineLength) == (size_t)lineLength);
+    }
+
+    if (SEND_USB_SERIAL) {
+      if (Serial.availableForWrite() < lineLength) {
+        if (!sent) {
+          break;
+        }
+      } else {
+        Serial.write((const uint8_t*)dataBuffer, lineLength);
+        sent = true;
+      }
+    }
+
+    if (!sent) {
+      break;
+    }
+  }
+}
+
+void sampleTask(void* parameter) {
+  unsigned long nextSampleTime = millis();
+
+  while (true) {
+    const unsigned long currentTime = millis();
+    if ((long)(currentTime - nextSampleTime) >= 0) {
+      nextSampleTime += SAMPLE_INTERVAL;
+      if ((long)(currentTime - nextSampleTime) >= (long)SAMPLE_INTERVAL) {
+        nextSampleTime = currentTime;
+      }
+
+      if (M5.Imu.update()) {
+        auto imuData = M5.Imu.getImuData();
+        ImuSample sample;
+        sample.index = ++sampleIndex;
+        sample.timeMs = nextSampleTime;
+        sample.accX = imuData.accel.x;
+        sample.accY = imuData.accel.y;
+        sample.accZ = imuData.accel.z;
+        sample.gyrX = imuData.gyro.x;
+        sample.gyrY = imuData.gyro.y;
+        sample.gyrZ = imuData.gyro.z;
+
+        if (SerialBT.hasClient() || SEND_USB_SERIAL) {
+          pushSample(sample);
+        }
+      }
+    }
+
+    vTaskDelay(1);
+  }
+}
 // 表示更新用
 void drawStatus(bool connected) {
   M5.Display.fillScreen(BLACK);
@@ -89,48 +220,16 @@ void setup() {
   Serial.println("[BT] Pair/connect from PC or smartphone via Bluetooth SPP.");
   Serial.println("index,timeMs,accX,accY,accZ,gyrX,gyrY,gyrZ");
   drawStatus(false);
-  lastSampleTime = millis();
+  xTaskCreatePinnedToCore(sampleTask, "imu_sample_task", 4096, NULL, 2, NULL, 1);
 }
 void loop() {
   M5.update();
   const bool clientConnected = SerialBT.hasClient();
   if (clientConnected != oldClientConnected) {
+    clearSampleBuffer();
     drawStatus(clientConnected);
     oldClientConnected = clientConnected;
   }
-  const unsigned long currentTime = millis();
-  if (currentTime - lastSampleTime >= SAMPLE_INTERVAL) {
-    lastSampleTime += SAMPLE_INTERVAL;
-    if (currentTime - lastSampleTime >= SAMPLE_INTERVAL) {
-      lastSampleTime = currentTime;
-    }
-    // IMUデータを更新できたときだけ読む
-    if (M5.Imu.update()) {
-      auto imuData = M5.Imu.getImuData();
-      float accX = imuData.accel.x;
-      float accY = imuData.accel.y;
-      float accZ = imuData.accel.z;
-      float gyrX = imuData.gyro.x;
-      float gyrY = imuData.gyro.y;
-      float gyrZ = imuData.gyro.z;
-      char dataBuffer[160];
-      // 小数4桁で出力
-      // 加速度: g 単位
-      // 角速度: deg/s 単位
-      sampleIndex++;
-      snprintf(dataBuffer, sizeof(dataBuffer),
-               "%lu,%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
-               (unsigned long)sampleIndex,
-               (unsigned long)currentTime,
-               accX, accY, accZ, gyrX, gyrY, gyrZ);
-      // Bluetooth接続中ならBluetoothにも送信
-      if (clientConnected) {
-        SerialBT.print(dataBuffer);
-      }
-      // USBシリアルにも出力
-      Serial.print(dataBuffer);
-    } else {
-      Serial.println("[IMU] update failed");
-    }
-  }
+
+  transmitBufferedSamples(clientConnected);
 }
