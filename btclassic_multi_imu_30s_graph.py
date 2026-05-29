@@ -3,7 +3,8 @@
 M5Stack Core2 Bluetooth Classic 複数IMU 30秒グラフ計測ツール
 
 Bluetooth Classic SPP の仮想シリアルポートを複数開き、接続後3秒待ってから
-30秒間の受信サンプル数を計測し、IMUごとの1秒あたり受信サンプル数をグラフ表示します。
+30秒間の受信サンプル数を計測し、IMU/重心動揺計ごとの1秒あたり受信サンプル数を
+グラフ表示します。
 """
 
 import argparse
@@ -17,10 +18,12 @@ from btclassic_multi_imu_sample_rate_monitor import (
     DEFAULT_DIAGNOSTICS_SECONDS,
     DEFAULT_TIMEOUT_SECONDS,
     convert_to_macos_tty_ports,
+    device_labels,
+    infer_device_configs_for_ports,
     import_serial_modules,
     print_no_sample_diagnostics,
     read_serial_lines,
-    select_connection_count,
+    select_device_configs,
     select_ports_from_list,
 )
 
@@ -31,7 +34,8 @@ DEFAULT_BIN_SECONDS = 1.0
 
 
 class GraphSampleCollector:
-    def __init__(self):
+    def __init__(self, data_columns=6):
+        self.data_columns = data_columns
         self._lock = threading.Lock()
         self.reset_measurement()
 
@@ -59,12 +63,12 @@ class GraphSampleCollector:
 
     def _process_line(self, line):
         values = line.strip().split(",")
-        if len(values) not in (6, 8):
+        if len(values) not in (self.data_columns, self.data_columns + 2):
             self._add_invalid_line()
             return
 
         try:
-            if len(values) == 8:
+            if len(values) == self.data_columns + 2:
                 sample_index = int(values[0])
                 sample_time_ms = float(values[1])
                 [float(value) for value in values[2:]]
@@ -145,6 +149,7 @@ def source_average_hz(source_samples):
 
 def plot_results(
     snapshots,
+    labels,
     start_time,
     warmup_seconds,
     duration_seconds,
@@ -156,7 +161,7 @@ def plot_results(
         return 1
 
     fig, ax = plt.subplots(figsize=(10, 5.5))
-    for index, snapshot in enumerate(snapshots, start=1):
+    for label, snapshot in zip(labels, snapshots):
         x_values, hz_values = make_receive_rate_series(
             snapshot["host_sample_times"],
             start_time,
@@ -164,13 +169,13 @@ def plot_results(
             bin_seconds,
         )
         source_hz = source_average_hz(snapshot["source_samples"])
-        label = f"IMU{index}"
+        line_label = label
         if source_hz is not None:
-            label += f" (source avg {source_hz:.1f} Hz)"
+            line_label += f" (source avg {source_hz:.1f} Hz)"
 
-        ax.plot(x_values, hz_values, marker="o", linewidth=1.8, label=label)
+        ax.plot(x_values, hz_values, marker="o", linewidth=1.8, label=line_label)
 
-    ax.set_title(f"Bluetooth Classic IMU receive rate after {warmup_seconds:g}s warmup")
+    ax.set_title(f"Bluetooth Classic receive rate after {warmup_seconds:g}s warmup")
     ax.set_xlabel("Measurement time (s)")
     ax.set_ylabel(f"Received samples per {bin_seconds:g}s (Hz)")
     ax.set_xlim(0, duration_seconds)
@@ -201,6 +206,7 @@ def wait_with_diagnostics(
     seconds,
     counters,
     ports,
+    device_labels_for_diagnostics,
     diagnostics_seconds,
     stop_event,
     errors,
@@ -230,7 +236,11 @@ def wait_with_diagnostics(
         if now >= next_diagnostics_time:
             snapshots = [counter.snapshot() for counter in counters]
             if all(snapshot["total_samples"] == 0 for snapshot in snapshots):
-                print_no_sample_diagnostics(ports, snapshots)
+                print_no_sample_diagnostics(
+                    ports,
+                    snapshots,
+                    device_labels_for_diagnostics,
+                )
             next_diagnostics_time = now + diagnostics_seconds
 
         sleep(min(0.02, remaining))
@@ -240,6 +250,8 @@ def wait_with_diagnostics(
 
 def monitor_and_plot(
     ports,
+    imu_count,
+    posturo_count,
     baudrate,
     timeout_seconds,
     diagnostics_seconds,
@@ -270,13 +282,21 @@ def monitor_and_plot(
         return 1
 
     if ports is None:
-        imu_count = select_connection_count()
-        ports = select_ports_from_list(list_ports, imu_count)
+        device_configs = select_device_configs(imu_count, posturo_count)
+        if device_configs is None:
+            return 1
+
+        ports = select_ports_from_list(list_ports, device_configs)
         if ports is None:
             return 1
-    elif len(ports) == 0:
-        print("少なくとも1つのポートを指定してください。")
-        return 1
+    else:
+        device_configs = infer_device_configs_for_ports(
+            len(ports),
+            imu_count=imu_count,
+            posturo_count=posturo_count,
+        )
+        if device_configs is None:
+            return 1
 
     if use_tty:
         converted_ports = convert_to_macos_tty_ports(ports)
@@ -285,6 +305,7 @@ def monitor_and_plot(
                 print(f"Using tty counterpart: {original_port} -> {converted_port}")
         ports = converted_ports
 
+    labels = device_labels(device_configs)
     serial_ports = []
     counters = []
     threads = []
@@ -294,7 +315,7 @@ def monitor_and_plot(
     snapshots = []
 
     try:
-        for index, port in enumerate(ports, start=1):
+        for device_config, port in zip(device_configs, ports):
             serial_port = serial.Serial(
                 port,
                 baudrate=baudrate,
@@ -302,16 +323,18 @@ def monitor_and_plot(
             )
             serial_port.reset_input_buffer()
             serial_ports.append(serial_port)
-            counters.append(GraphSampleCollector())
-            print(f"IMU{index}: Opened serial port {port} ({baudrate} bps)")
+            counters.append(
+                GraphSampleCollector(data_columns=device_config["data_columns"])
+            )
+            print(f"{device_config['label']}: Opened serial port {port} ({baudrate} bps)")
 
-        for index, serial_port in enumerate(serial_ports, start=1):
+        for label, serial_port, counter in zip(labels, serial_ports, counters):
             thread = threading.Thread(
                 target=read_serial_lines,
                 args=(
-                    f"IMU{index}",
+                    label,
                     serial_port,
-                    counters[index - 1],
+                    counter,
                     stop_event,
                     errors,
                 ),
@@ -325,6 +348,7 @@ def monitor_and_plot(
             warmup_seconds,
             counters,
             ports,
+            labels,
             diagnostics_seconds,
             stop_event,
             errors,
@@ -341,6 +365,7 @@ def monitor_and_plot(
             duration_seconds,
             counters,
             ports,
+            labels,
             diagnostics_seconds,
             stop_event,
             errors,
@@ -350,7 +375,7 @@ def monitor_and_plot(
 
         snapshots = [counter.snapshot() for counter in counters]
         if all(snapshot["total_samples"] == 0 for snapshot in snapshots):
-            print_no_sample_diagnostics(ports, snapshots)
+            print_no_sample_diagnostics(ports, snapshots, labels)
 
     except KeyboardInterrupt:
         print("\nStopping...")
@@ -370,10 +395,10 @@ def monitor_and_plot(
 
         if counters:
             summaries = []
-            for index, counter in enumerate(counters, start=1):
+            for label, counter in zip(labels, counters):
                 snapshot = counter.snapshot()
                 summaries.append(
-                    f"IMU{index}: total={snapshot['total_samples']}, "
+                    f"{label}: total={snapshot['total_samples']}, "
                     f"lines={snapshot['received_lines']}, "
                     f"bytes={snapshot['raw_bytes']}, "
                     f"invalid_lines={snapshot['invalid_lines']}, "
@@ -386,6 +411,7 @@ def monitor_and_plot(
 
     return plot_results(
         snapshots,
+        labels,
         measurement_start,
         warmup_seconds,
         duration_seconds,
@@ -397,7 +423,7 @@ def monitor_and_plot(
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "M5Stack Core2 Bluetooth Classic IMUを複数台接続し、"
+            "M5Stack Core2 Bluetooth Classic IMU/重心動揺計を複数台接続し、"
             "接続後3秒待ってから30秒間の受信サンプル数をグラフ表示します。"
         )
     )
@@ -405,9 +431,22 @@ def parse_args():
         "--ports",
         nargs="+",
         help=(
-            "使用するシリアルポートをIMU順に指定します。"
+            "使用するシリアルポートをIMU、重心動揺計の順に指定します。"
             "未指定の場合は接続台数とポートを番号で選択します。"
         ),
+    )
+    parser.add_argument(
+        "--imu-count",
+        type=int,
+        help=(
+            "接続するIMU台数。--ports指定時に重心動揺計と混在させる場合に使います。"
+            "未指定かつ--ports指定時は全ポートをIMUとして扱います。"
+        ),
+    )
+    parser.add_argument(
+        "--posturo-count",
+        type=int,
+        help="接続する重心動揺計台数。CSVは index,timeMs,data1,data2,data3,data4 を想定します。",
     )
     parser.add_argument(
         "--baudrate",
@@ -467,6 +506,8 @@ def main():
     args = parse_args()
     return monitor_and_plot(
         ports=args.ports,
+        imu_count=args.imu_count,
+        posturo_count=args.posturo_count,
         baudrate=args.baudrate,
         timeout_seconds=args.timeout,
         diagnostics_seconds=args.diagnostics,

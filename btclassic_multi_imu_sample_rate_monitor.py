@@ -20,9 +20,23 @@ DEFAULT_TIMEOUT_SECONDS = 0.1
 DEFAULT_DIAGNOSTICS_SECONDS = 5.0
 DEFAULT_RATE_WINDOW_SECONDS = 1.0
 
+DEVICE_DEFINITIONS = {
+    "imu": {
+        "label_prefix": "IMU",
+        "prompt_name": "IMU",
+        "data_columns": 6,
+    },
+    "posturo": {
+        "label_prefix": "Posturo",
+        "prompt_name": "重心動揺計",
+        "data_columns": 4,
+    },
+}
+
 
 class SampleCounter:
-    def __init__(self):
+    def __init__(self, data_columns=6):
+        self.data_columns = data_columns
         self._lock = threading.Lock()
         self.total_samples = 0
         self.invalid_lines = 0
@@ -46,14 +60,14 @@ class SampleCounter:
         self._process_line(line)
 
     def _process_line(self, line):
-        """6値または index,timeMs付き8値のIMU CSVをサンプルとして数える。"""
+        """data列のみ、または index,timeMs 付きCSVをサンプルとして数える。"""
         values = line.strip().split(",")
-        if len(values) not in (6, 8):
+        if len(values) not in (self.data_columns, self.data_columns + 2):
             self._add_invalid_line()
             return
 
         try:
-            if len(values) == 8:
+            if len(values) == self.data_columns + 2:
                 sample_index = int(values[0])
                 sample_time_ms = float(values[1])
                 [float(value) for value in values[2:]]
@@ -150,6 +164,93 @@ def read_positive_int(prompt):
         print("1以上の数字を入力してください。")
 
 
+def read_nonnegative_int(prompt):
+    while True:
+        choice = input(prompt).strip()
+
+        try:
+            value = int(choice)
+        except ValueError:
+            print("番号で入力してください。")
+            continue
+
+        if value >= 0:
+            return value
+
+        print("0以上の数字を入力してください。")
+
+
+def build_device_configs(imu_count, posturo_count):
+    if imu_count < 0 or posturo_count < 0:
+        return None
+
+    device_configs = []
+    for device_type, count in (("imu", imu_count), ("posturo", posturo_count)):
+        definition = DEVICE_DEFINITIONS[device_type]
+        for number in range(1, count + 1):
+            label = f"{definition['label_prefix']}{number}"
+            device_configs.append(
+                {
+                    "type": device_type,
+                    "label": label,
+                    "prompt_label": label
+                    if device_type == "imu"
+                    else f"{definition['prompt_name']}{number}",
+                    "data_columns": definition["data_columns"],
+                }
+            )
+
+    return device_configs
+
+
+def select_device_configs(imu_count=None, posturo_count=None):
+    if imu_count is None and posturo_count is None:
+        imu_count = read_nonnegative_int("接続するIMU台数を入力してください: ")
+        posturo_count = read_nonnegative_int("接続する重心動揺計台数を入力してください: ")
+    else:
+        imu_count = 0 if imu_count is None else imu_count
+        posturo_count = 0 if posturo_count is None else posturo_count
+
+    device_configs = build_device_configs(imu_count, posturo_count)
+    if device_configs is None:
+        print("接続台数は0以上の数字を指定してください。")
+        return None
+
+    if not device_configs:
+        print("IMUまたは重心動揺計を少なくとも1台指定してください。")
+        return None
+
+    return device_configs
+
+
+def infer_device_configs_for_ports(port_count, imu_count=None, posturo_count=None):
+    if port_count <= 0:
+        print("少なくとも1つのポートを指定してください。")
+        return None
+
+    if imu_count is None and posturo_count is None:
+        imu_count = port_count
+        posturo_count = 0
+    elif imu_count is None:
+        imu_count = port_count - posturo_count
+    elif posturo_count is None:
+        posturo_count = port_count - imu_count
+
+    device_configs = build_device_configs(imu_count, posturo_count)
+    if device_configs is None:
+        print("接続台数は0以上の数字を指定してください。")
+        return None
+
+    if len(device_configs) != port_count:
+        print(
+            "指定したポート数と台数設定が一致しません: "
+            f"ports={port_count}, IMU={imu_count}, 重心動揺計={posturo_count}"
+        )
+        return None
+
+    return device_configs
+
+
 def select_connection_count():
     return read_positive_int("接続するIMU台数を入力してください: ")
 
@@ -173,7 +274,20 @@ def convert_to_macos_tty_ports(ports):
     return converted_ports
 
 
-def select_ports_from_list(list_ports, imu_count):
+def normalize_device_configs(device_configs_or_count):
+    if isinstance(device_configs_or_count, int):
+        return build_device_configs(device_configs_or_count, 0)
+
+    return list(device_configs_or_count)
+
+
+def device_labels(device_configs):
+    return [device_config["label"] for device_config in device_configs]
+
+
+def select_ports_from_list(list_ports, device_configs_or_count):
+    device_configs = normalize_device_configs(device_configs_or_count)
+    connection_count = len(device_configs)
     ports = sorted(list_ports.comports(), key=lambda port: port.device)
 
     if not ports:
@@ -181,9 +295,9 @@ def select_ports_from_list(list_ports, imu_count):
         print("M5Stack Core2 と Bluetooth Classic でペアリング済みか確認してください。")
         return None
 
-    if imu_count > len(ports):
+    if connection_count > len(ports):
         print(
-            f"接続台数 {imu_count} 台に対して、利用可能なポートが {len(ports)} 個しかありません。"
+            f"接続台数 {connection_count} 台に対して、利用可能なポートが {len(ports)} 個しかありません。"
         )
         return None
 
@@ -194,9 +308,10 @@ def select_ports_from_list(list_ports, imu_count):
     selected_ports = []
     selected_numbers = set()
 
-    for imu_index in range(1, imu_count + 1):
+    for device_config in device_configs:
+        prompt_label = device_config["prompt_label"]
         while True:
-            choice = input(f"IMU{imu_index}で使用するポート番号を入力してください: ").strip()
+            choice = input(f"{prompt_label}で使用するポート番号を入力してください: ").strip()
 
             try:
                 port_number = int(choice)
@@ -234,27 +349,31 @@ def read_serial_lines(imu_name, serial_port, counter, stop_event, errors):
             sleep(0.001)
 
 
-def print_stream_header(imu_count, rate_window_seconds, source_rate):
+def print_stream_header(device_configs_or_count, rate_window_seconds, source_rate):
+    labels = device_labels(normalize_device_configs(device_configs_or_count))
     if source_rate:
         window_label = f"{rate_window_seconds:g}s"
         columns = [
-            f"IMU{index}_source_hz_{window_label}" for index in range(1, imu_count + 1)
+            f"{label}_source_hz_{window_label}" for label in labels
         ]
     elif rate_window_seconds <= DEFAULT_RATE_WINDOW_SECONDS:
-        columns = [f"IMU{index}_samples_per_sec" for index in range(1, imu_count + 1)]
+        columns = [f"{label}_samples_per_sec" for label in labels]
     else:
         window_label = f"{rate_window_seconds:g}s"
         columns = [
-            f"IMU{index}_rolling_hz_{window_label}" for index in range(1, imu_count + 1)
+            f"{label}_rolling_hz_{window_label}" for label in labels
         ]
     print(",".join(columns), flush=True)
 
 
-def format_diagnostics(port_labels, snapshots):
+def format_diagnostics(port_labels, snapshots, labels=None):
+    if labels is None:
+        labels = [f"IMU{index}" for index in range(1, len(port_labels) + 1)]
+
     chunks = []
-    for index, (port, snapshot) in enumerate(zip(port_labels, snapshots), start=1):
+    for label, port, snapshot in zip(labels, port_labels, snapshots):
         chunks.append(
-            f"IMU{index}({port}): "
+            f"{label}({port}): "
             f"bytes={snapshot['raw_bytes']}, "
             f"lines={snapshot['received_lines']}, "
             f"valid={snapshot['total_samples']}, "
@@ -264,10 +383,13 @@ def format_diagnostics(port_labels, snapshots):
     return " | ".join(chunks)
 
 
-def print_no_sample_diagnostics(port_labels, snapshots):
+def print_no_sample_diagnostics(port_labels, snapshots, labels=None):
+    if labels is None:
+        labels = [f"IMU{index}" for index in range(1, len(port_labels) + 1)]
+
     print(
-        "[diagnostic] まだ有効な6値CSVサンプルを受信できていません: "
-        + format_diagnostics(port_labels, snapshots),
+        "[diagnostic] まだ有効なCSVサンプルを受信できていません: "
+        + format_diagnostics(port_labels, snapshots, labels),
         file=sys.stderr,
         flush=True,
     )
@@ -286,10 +408,10 @@ def print_no_sample_diagnostics(port_labels, snapshots):
             flush=True,
         )
         tty_hints = [
-            f"IMU{index}: {tty_port}"
-            for index, tty_port in (
-                (index, macos_tty_counterpart(port))
-                for index, port in enumerate(port_labels, start=1)
+            f"{label}: {tty_port}"
+            for label, tty_port in (
+                (label, macos_tty_counterpart(port))
+                for label, port in zip(labels, port_labels)
             )
             if tty_port
         ]
@@ -302,10 +424,10 @@ def print_no_sample_diagnostics(port_labels, snapshots):
             )
         return
 
-    for index, snapshot in enumerate(snapshots, start=1):
+    for label, snapshot in zip(labels, snapshots):
         if snapshot["invalid_lines"] and snapshot["last_line_preview"]:
             print(
-                f"[diagnostic] IMU{index} の最後の無効行候補: "
+                f"[diagnostic] {label} の最後の無効行候補: "
                 f"{snapshot['last_line_preview']!r}",
                 file=sys.stderr,
                 flush=True,
@@ -314,6 +436,8 @@ def print_no_sample_diagnostics(port_labels, snapshots):
 
 def monitor_multi_sample_rate(
     ports,
+    imu_count,
+    posturo_count,
     baudrate,
     interval_seconds,
     timeout_seconds,
@@ -339,14 +463,20 @@ def monitor_multi_sample_rate(
         return 1
 
     if ports is None:
-        imu_count = select_connection_count()
-        ports = select_ports_from_list(list_ports, imu_count)
+        device_configs = select_device_configs(imu_count, posturo_count)
+        if device_configs is None:
+            return 1
+
+        ports = select_ports_from_list(list_ports, device_configs)
         if ports is None:
             return 1
     else:
-        imu_count = len(ports)
-        if imu_count == 0:
-            print("少なくとも1つのポートを指定してください。")
+        device_configs = infer_device_configs_for_ports(
+            len(ports),
+            imu_count=imu_count,
+            posturo_count=posturo_count,
+        )
+        if device_configs is None:
             return 1
 
     if use_tty:
@@ -356,6 +486,7 @@ def monitor_multi_sample_rate(
                 print(f"Using tty counterpart: {original_port} -> {converted_port}")
         ports = converted_ports
 
+    labels = device_labels(device_configs)
     serial_ports = []
     counters = []
     threads = []
@@ -363,7 +494,7 @@ def monitor_multi_sample_rate(
     stop_event = threading.Event()
 
     try:
-        for index, port in enumerate(ports, start=1):
+        for device_config, port in zip(device_configs, ports):
             serial_port = serial.Serial(
                 port,
                 baudrate=baudrate,
@@ -371,16 +502,16 @@ def monitor_multi_sample_rate(
             )
             serial_port.reset_input_buffer()
             serial_ports.append(serial_port)
-            counters.append(SampleCounter())
-            print(f"IMU{index}: Opened serial port {port} ({baudrate} bps)")
+            counters.append(SampleCounter(data_columns=device_config["data_columns"]))
+            print(f"{device_config['label']}: Opened serial port {port} ({baudrate} bps)")
 
-        for index, serial_port in enumerate(serial_ports, start=1):
+        for label, serial_port, counter in zip(labels, serial_ports, counters):
             thread = threading.Thread(
                 target=read_serial_lines,
                 args=(
-                    f"IMU{index}",
+                    label,
                     serial_port,
-                    counters[index - 1],
+                    counter,
                     stop_event,
                     errors,
                 ),
@@ -401,7 +532,7 @@ def monitor_multi_sample_rate(
                     f"直近{rate_window_seconds:g}秒の移動平均Hzを出力します。",
                     file=sys.stderr,
                 )
-        print_stream_header(len(counters), rate_window_seconds, source_rate)
+        print_stream_header(device_configs, rate_window_seconds, source_rate)
 
         last_totals = [0 for _ in counters]
         next_print_time = perf_counter() + interval_seconds
@@ -443,7 +574,7 @@ def monitor_multi_sample_rate(
             next_print_time += interval_seconds
 
             if all(total == 0 for total in totals) and now >= next_diagnostics_time:
-                print_no_sample_diagnostics(ports, snapshots)
+                print_no_sample_diagnostics(ports, snapshots, labels)
                 next_diagnostics_time = now + diagnostics_seconds
             elif (
                 source_rate
@@ -451,8 +582,8 @@ def monitor_multi_sample_rate(
                 and any(snapshot["source_rows"] == 0 for snapshot in snapshots)
             ):
                 print(
-                    "[diagnostic] --source-rate には index,timeMs 付きの8列CSVが必要です。"
-                    "更新済みArduinoスケッチを書き込んでください。",
+                    "[diagnostic] --source-rate には index,timeMs 付きCSVが必要です。"
+                    "IMUは8列、重心動揺計は6列の形式にしてください。",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -486,10 +617,10 @@ def monitor_multi_sample_rate(
 
         if counters:
             summaries = []
-            for index, counter in enumerate(counters, start=1):
+            for label, counter in zip(labels, counters):
                 snapshot = counter.snapshot()
                 summaries.append(
-                    f"IMU{index}: total={snapshot['total_samples']}, "
+                    f"{label}: total={snapshot['total_samples']}, "
                     f"lines={snapshot['received_lines']}, "
                     f"bytes={snapshot['raw_bytes']}, "
                     f"invalid_lines={snapshot['invalid_lines']}, "
@@ -501,17 +632,30 @@ def monitor_multi_sample_rate(
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "M5Stack Core2 Bluetooth Classic IMUを複数台接続し、"
-            "各IMUの1秒ごとの受信サンプル数をCSV形式で表示します。"
+            "M5Stack Core2 Bluetooth Classic IMU/重心動揺計を複数台接続し、"
+            "各機器の1秒ごとの受信サンプル数をCSV形式で表示します。"
         )
     )
     parser.add_argument(
         "--ports",
         nargs="+",
         help=(
-            "使用するシリアルポートをIMU順に指定します。"
+            "使用するシリアルポートをIMU、重心動揺計の順に指定します。"
             "未指定の場合は接続台数とポートを番号で選択します。"
         ),
+    )
+    parser.add_argument(
+        "--imu-count",
+        type=int,
+        help=(
+            "接続するIMU台数。--ports指定時に重心動揺計と混在させる場合に使います。"
+            "未指定かつ--ports指定時は全ポートをIMUとして扱います。"
+        ),
+    )
+    parser.add_argument(
+        "--posturo-count",
+        type=int,
+        help="接続する重心動揺計台数。CSVは index,timeMs,data1,data2,data3,data4 を想定します。",
     )
     parser.add_argument(
         "--baudrate",
@@ -554,7 +698,8 @@ def parse_args():
         "--source-rate",
         action="store_true",
         help=(
-            "index,timeMs付き8列CSVから、M5側時刻ベースのHzを表示します。"
+            "index,timeMs付きCSVから、送信元時刻ベースのHzを表示します。"
+            "IMUは8列、重心動揺計は6列を想定します。"
             "Bluetooth受信バーストの影響を受けにくい確認用です。"
         ),
     )
@@ -574,6 +719,8 @@ def main():
         args = parse_args()
         return monitor_multi_sample_rate(
             ports=args.ports,
+            imu_count=args.imu_count,
+            posturo_count=args.posturo_count,
             baudrate=args.baudrate,
             interval_seconds=args.interval,
             timeout_seconds=args.timeout,
