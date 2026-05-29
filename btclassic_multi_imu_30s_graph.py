@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-M5Stack Core2 Bluetooth Classic 複数IMU 30秒グラフ計測ツール
+M5Stack Core2 Bluetooth Classic 複数機器 30秒XYZグラフ計測ツール
 
 Bluetooth Classic SPP の仮想シリアルポートを複数開き、接続後3秒待ってから
-30秒間の受信サンプル数を計測し、IMU/重心動揺計ごとの1秒あたり受信サンプル数を
-グラフ表示します。
+30秒間のデータを計測し、X/Y/Zの3グラフを並べて表示します。
 """
 
 import argparse
-import math
 import sys
 import threading
 from time import perf_counter, sleep
@@ -30,7 +28,6 @@ from btclassic_multi_imu_sample_rate_monitor import (
 
 DEFAULT_WARMUP_SECONDS = 3.0
 DEFAULT_DURATION_SECONDS = 30.0
-DEFAULT_BIN_SECONDS = 1.0
 
 
 class GraphSampleCollector:
@@ -47,6 +44,7 @@ class GraphSampleCollector:
             self.raw_bytes = 0
             self.last_line_preview = ""
             self.host_sample_times = []
+            self.axis_samples = []
             self.source_samples = []
 
     def process_raw_line(self, raw_line):
@@ -71,11 +69,11 @@ class GraphSampleCollector:
             if len(values) == self.data_columns + 2:
                 sample_index = int(values[0])
                 sample_time_ms = float(values[1])
-                [float(value) for value in values[2:]]
+                data_values = [float(value) for value in values[2:]]
             else:
                 sample_index = None
                 sample_time_ms = None
-                [float(value) for value in values]
+                data_values = [float(value) for value in values]
         except ValueError:
             self._add_invalid_line()
             return
@@ -84,6 +82,7 @@ class GraphSampleCollector:
         with self._lock:
             self.total_samples += 1
             self.host_sample_times.append(now)
+            self.axis_samples.append((now, data_values[:3]))
             if sample_index is not None and sample_time_ms is not None:
                 self.source_samples.append((sample_index, sample_time_ms, now))
 
@@ -101,6 +100,7 @@ class GraphSampleCollector:
                 "last_line_preview": self.last_line_preview,
                 "source_rows": len(self.source_samples),
                 "host_sample_times": list(self.host_sample_times),
+                "axis_samples": list(self.axis_samples),
                 "source_samples": list(self.source_samples),
             }
 
@@ -116,24 +116,6 @@ def import_matplotlib():
     return plt
 
 
-def make_receive_rate_series(host_sample_times, start_time, duration_seconds, bin_seconds):
-    bin_count = max(1, int(math.ceil(duration_seconds / bin_seconds)))
-    counts = [0 for _ in range(bin_count)]
-
-    for sample_time in host_sample_times:
-        elapsed = sample_time - start_time
-        if not 0 <= elapsed < duration_seconds:
-            continue
-
-        bin_index = int(elapsed // bin_seconds)
-        if 0 <= bin_index < bin_count:
-            counts[bin_index] += 1
-
-    x_values = [(index + 0.5) * bin_seconds for index in range(bin_count)]
-    hz_values = [count / bin_seconds for count in counts]
-    return x_values, hz_values
-
-
 def source_average_hz(source_samples):
     if len(source_samples) < 2:
         return None
@@ -147,42 +129,63 @@ def source_average_hz(source_samples):
     return (last_index - first_index) / elapsed_seconds
 
 
+def make_axis_series(axis_samples, axis_index, start_time, duration_seconds):
+    x_values = []
+    y_values = []
+
+    for sample_time, data_values in axis_samples:
+        if axis_index >= len(data_values):
+            continue
+
+        elapsed = sample_time - start_time
+        if not 0 <= elapsed <= duration_seconds:
+            continue
+
+        x_values.append(elapsed)
+        y_values.append(data_values[axis_index])
+
+    return x_values, y_values
+
+
 def plot_results(
     snapshots,
     labels,
     start_time,
     warmup_seconds,
     duration_seconds,
-    bin_seconds,
     save_path,
 ):
     plt = import_matplotlib()
     if plt is None:
         return 1
 
-    fig, ax = plt.subplots(figsize=(10, 5.5))
-    for label, snapshot in zip(labels, snapshots):
-        x_values, hz_values = make_receive_rate_series(
-            snapshot["host_sample_times"],
-            start_time,
-            duration_seconds,
-            bin_seconds,
-        )
-        source_hz = source_average_hz(snapshot["source_samples"])
-        line_label = label
-        if source_hz is not None:
-            line_label += f" (source avg {source_hz:.1f} Hz)"
+    axis_names = ("X", "Y", "Z")
+    axis_value_names = ("X / ax / data1", "Y / ay / data2", "Z / az / data3")
+    fig, axes = plt.subplots(3, 1, sharex=True, figsize=(11, 8))
+    for axis_index, ax in enumerate(axes):
+        for label, snapshot in zip(labels, snapshots):
+            x_values, y_values = make_axis_series(
+                snapshot["axis_samples"],
+                axis_index,
+                start_time,
+                duration_seconds,
+            )
+            source_hz = source_average_hz(snapshot["source_samples"])
+            line_label = label
+            if source_hz is not None:
+                line_label += f" ({source_hz:.1f} Hz)"
 
-        ax.plot(x_values, hz_values, marker="o", linewidth=1.8, label=line_label)
+            ax.plot(x_values, y_values, linewidth=1.3, label=line_label)
 
-    ax.set_title(f"Bluetooth Classic receive rate after {warmup_seconds:g}s warmup")
-    ax.set_xlabel("Measurement time (s)")
-    ax.set_ylabel(f"Received samples per {bin_seconds:g}s (Hz)")
-    ax.set_xlim(0, duration_seconds)
-    ax.set_ylim(bottom=0)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
+        ax.set_title(axis_names[axis_index])
+        ax.set_ylabel(axis_value_names[axis_index])
+        ax.set_xlim(0, duration_seconds)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right")
+
+    axes[-1].set_xlabel("Measurement time (s)")
+    fig.suptitle(f"Bluetooth Classic XYZ data after {warmup_seconds:g}s warmup")
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
 
     if save_path:
         fig.savefig(save_path, dpi=150)
@@ -257,7 +260,6 @@ def monitor_and_plot(
     diagnostics_seconds,
     warmup_seconds,
     duration_seconds,
-    bin_seconds,
     use_tty,
     save_path,
 ):
@@ -272,13 +274,8 @@ def monitor_and_plot(
         validate_positive("診断表示間隔", diagnostics_seconds),
         validate_positive("接続後待機時間", warmup_seconds),
         validate_positive("計測時間", duration_seconds),
-        validate_positive("グラフ集計幅", bin_seconds),
     ]
     if not all(validations):
-        return 1
-
-    if bin_seconds > duration_seconds:
-        print("グラフ集計幅は計測時間以下にしてください。")
         return 1
 
     if ports is None:
@@ -415,7 +412,6 @@ def monitor_and_plot(
         measurement_start,
         warmup_seconds,
         duration_seconds,
-        bin_seconds,
         save_path,
     )
 
@@ -424,7 +420,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "M5Stack Core2 Bluetooth Classic IMU/重心動揺計を複数台接続し、"
-            "接続後3秒待ってから30秒間の受信サンプル数をグラフ表示します。"
+            "接続後3秒待ってから30秒間のX/Y/Zデータを3グラフで表示します。"
         )
     )
     parser.add_argument(
@@ -481,12 +477,7 @@ def parse_args():
         default=DEFAULT_DURATION_SECONDS,
         help=f"計測する秒数。デフォルト: {DEFAULT_DURATION_SECONDS}",
     )
-    parser.add_argument(
-        "--bin",
-        type=float,
-        default=DEFAULT_BIN_SECONDS,
-        help=f"グラフの集計幅（秒）。デフォルト: {DEFAULT_BIN_SECONDS}",
-    )
+    parser.add_argument("--bin", type=float, help=argparse.SUPPRESS)
     parser.add_argument(
         "--save",
         help="グラフをPNGなどで保存するパス。未指定なら表示のみ行います。",
@@ -513,7 +504,6 @@ def main():
         diagnostics_seconds=args.diagnostics,
         warmup_seconds=args.warmup,
         duration_seconds=args.duration,
-        bin_seconds=args.bin,
         use_tty=args.use_tty,
         save_path=args.save,
     )
