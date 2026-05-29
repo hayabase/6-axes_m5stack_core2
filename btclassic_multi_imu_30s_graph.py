@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-M5Stack Core2 Bluetooth Classic 複数機器 30秒XYZグラフ計測ツール
+M5Stack Core2 Bluetooth Classic 複数機器 30秒グラフ計測ツール
 
 Bluetooth Classic SPP の仮想シリアルポートを複数開き、接続後3秒待ってから
-30秒間のデータを計測し、X/Y/Zの3グラフを並べて表示します。
+30秒間のデータを計測し、IMUは3グラフ、重心動揺計は4グラフに分けて表示します。
 """
 
 import argparse
 import sys
 import threading
+from pathlib import Path
 from time import perf_counter, sleep
 
 from btclassic_multi_imu_sample_rate_monitor import (
@@ -28,6 +29,20 @@ from btclassic_multi_imu_sample_rate_monitor import (
 
 DEFAULT_WARMUP_SECONDS = 3.0
 DEFAULT_DURATION_SECONDS = 30.0
+PLOT_DEFINITIONS = {
+    "imu": {
+        "title": "IMU",
+        "axes": ("ax", "ay", "az"),
+        "suffix": "imu",
+        "figsize": (11, 8),
+    },
+    "posturo": {
+        "title": "Posturography",
+        "axes": ("data1", "data2", "data3", "data4"),
+        "suffix": "posturo",
+        "figsize": (11, 9),
+    },
+}
 
 
 class GraphSampleCollector:
@@ -44,7 +59,7 @@ class GraphSampleCollector:
             self.raw_bytes = 0
             self.last_line_preview = ""
             self.host_sample_times = []
-            self.axis_samples = []
+            self.data_samples = []
             self.source_samples = []
 
     def process_raw_line(self, raw_line):
@@ -82,7 +97,7 @@ class GraphSampleCollector:
         with self._lock:
             self.total_samples += 1
             self.host_sample_times.append(now)
-            self.axis_samples.append((now, data_values[:3]))
+            self.data_samples.append((now, data_values))
             if sample_index is not None and sample_time_ms is not None:
                 self.source_samples.append((sample_index, sample_time_ms, now))
 
@@ -100,7 +115,7 @@ class GraphSampleCollector:
                 "last_line_preview": self.last_line_preview,
                 "source_rows": len(self.source_samples),
                 "host_sample_times": list(self.host_sample_times),
-                "axis_samples": list(self.axis_samples),
+                "data_samples": list(self.data_samples),
                 "source_samples": list(self.source_samples),
             }
 
@@ -129,12 +144,12 @@ def source_average_hz(source_samples):
     return (last_index - first_index) / elapsed_seconds
 
 
-def make_axis_series(axis_samples, axis_index, start_time, duration_seconds):
+def make_data_series(data_samples, data_index, start_time, duration_seconds):
     x_values = []
     y_values = []
 
-    for sample_time, data_values in axis_samples:
-        if axis_index >= len(data_values):
+    for sample_time, data_values in data_samples:
+        if data_index >= len(data_values):
             continue
 
         elapsed = sample_time - start_time
@@ -142,14 +157,88 @@ def make_axis_series(axis_samples, axis_index, start_time, duration_seconds):
             continue
 
         x_values.append(elapsed)
-        y_values.append(data_values[axis_index])
+        y_values.append(data_values[data_index])
 
     return x_values, y_values
+
+
+def save_figure(fig, save_path, suffix, split_save):
+    if split_save:
+        path = Path(save_path)
+        if path.suffix:
+            output_path = path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+        else:
+            output_path = path.with_name(f"{path.name}_{suffix}.png")
+    else:
+        output_path = Path(save_path)
+
+    fig.savefig(output_path, dpi=150)
+    print(f"Saved graph: {output_path}")
+
+
+def plot_device_group(
+    plt,
+    plot_definition,
+    group_items,
+    start_time,
+    warmup_seconds,
+    duration_seconds,
+):
+    axis_names = plot_definition["axes"]
+    fig, axes = plt.subplots(
+        len(axis_names),
+        1,
+        sharex=True,
+        figsize=plot_definition["figsize"],
+    )
+    for axis_index, ax in enumerate(axes):
+        plotted = False
+        for label, snapshot in group_items:
+            x_values, y_values = make_data_series(
+                snapshot["data_samples"],
+                axis_index,
+                start_time,
+                duration_seconds,
+            )
+            if not x_values:
+                continue
+
+            source_hz = source_average_hz(snapshot["source_samples"])
+            line_label = label
+            if source_hz is not None:
+                line_label += f" ({source_hz:.1f} Hz)"
+
+            ax.plot(x_values, y_values, linewidth=1.3, label=line_label)
+            plotted = True
+
+        ax.set_title(axis_names[axis_index])
+        ax.set_ylabel(axis_names[axis_index])
+        ax.set_xlim(0, duration_seconds)
+        ax.grid(True, alpha=0.3)
+        if plotted:
+            ax.legend(loc="upper right")
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "No valid samples",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+            )
+
+    axes[-1].set_xlabel("Measurement time (s)")
+    fig.suptitle(
+        f"{plot_definition['title']} data after {warmup_seconds:g}s warmup"
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    return fig
 
 
 def plot_results(
     snapshots,
     labels,
+    device_configs,
     start_time,
     warmup_seconds,
     duration_seconds,
@@ -159,37 +248,34 @@ def plot_results(
     if plt is None:
         return 1
 
-    axis_names = ("X", "Y", "Z")
-    axis_value_names = ("X / ax / data1", "Y / ay / data2", "Z / az / data3")
-    fig, axes = plt.subplots(3, 1, sharex=True, figsize=(11, 8))
-    for axis_index, ax in enumerate(axes):
-        for label, snapshot in zip(labels, snapshots):
-            x_values, y_values = make_axis_series(
-                snapshot["axis_samples"],
-                axis_index,
-                start_time,
-                duration_seconds,
+    figures = []
+    for device_type, plot_definition in PLOT_DEFINITIONS.items():
+        group_items = [
+            (label, snapshot)
+            for label, snapshot, device_config in zip(labels, snapshots, device_configs)
+            if device_config["type"] == device_type
+        ]
+        if not group_items:
+            continue
+
+        figures.append(
+            (
+                plot_definition,
+                plot_device_group(
+                    plt,
+                    plot_definition,
+                    group_items,
+                    start_time,
+                    warmup_seconds,
+                    duration_seconds,
+                ),
             )
-            source_hz = source_average_hz(snapshot["source_samples"])
-            line_label = label
-            if source_hz is not None:
-                line_label += f" ({source_hz:.1f} Hz)"
-
-            ax.plot(x_values, y_values, linewidth=1.3, label=line_label)
-
-        ax.set_title(axis_names[axis_index])
-        ax.set_ylabel(axis_value_names[axis_index])
-        ax.set_xlim(0, duration_seconds)
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="upper right")
-
-    axes[-1].set_xlabel("Measurement time (s)")
-    fig.suptitle(f"Bluetooth Classic XYZ data after {warmup_seconds:g}s warmup")
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+        )
 
     if save_path:
-        fig.savefig(save_path, dpi=150)
-        print(f"Saved graph: {save_path}")
+        split_save = len(figures) > 1
+        for plot_definition, fig in figures:
+            save_figure(fig, save_path, plot_definition["suffix"], split_save)
 
     print("グラフを閉じるとプログラムが終了します。")
     plt.show()
@@ -409,6 +495,7 @@ def monitor_and_plot(
     return plot_results(
         snapshots,
         labels,
+        device_configs,
         measurement_start,
         warmup_seconds,
         duration_seconds,
@@ -420,7 +507,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "M5Stack Core2 Bluetooth Classic IMU/重心動揺計を複数台接続し、"
-            "接続後3秒待ってから30秒間のX/Y/Zデータを3グラフで表示します。"
+            "IMUは3グラフ、重心動揺計は4グラフに分けて表示します。"
         )
     )
     parser.add_argument(
