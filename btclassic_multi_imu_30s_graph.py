@@ -3,7 +3,7 @@
 M5Stack Core2 Bluetooth Classic 複数機器 30秒グラフ計測ツール
 
 Bluetooth Classic SPP の仮想シリアルポートを複数開き、接続後3秒待ってから
-30秒間のデータを計測し、IMUは3グラフ、重心動揺計は4グラフに分けて表示します。
+30秒間のデータを計測し、IMU加速度、IMUジャイロ、重心動揺計に分けて表示します。
 """
 
 import argparse
@@ -29,20 +29,29 @@ from btclassic_multi_imu_sample_rate_monitor import (
 
 DEFAULT_WARMUP_SECONDS = 3.0
 DEFAULT_DURATION_SECONDS = 30.0
-PLOT_DEFINITIONS = {
-    "imu": {
-        "title": "IMU",
-        "axes": ("ax", "ay", "az"),
-        "suffix": "imu",
+PLOT_DEFINITIONS = [
+    {
+        "device_type": "imu",
+        "title": "IMU acceleration",
+        "axes": (("ax", 0), ("ay", 1), ("az", 2)),
+        "suffix": "imu_accel",
         "figsize": (11, 8),
     },
-    "posturo": {
+    {
+        "device_type": "imu",
+        "title": "IMU gyroscope",
+        "axes": (("gx", 3), ("gy", 4), ("gz", 5)),
+        "suffix": "imu_gyro",
+        "figsize": (11, 8),
+    },
+    {
+        "device_type": "posturo",
         "title": "Posturography",
-        "axes": ("data1", "data2", "data3", "data4"),
+        "axes": (("data1", 0), ("data2", 1), ("data3", 2), ("data4", 3)),
         "suffix": "posturo",
         "figsize": (11, 9),
     },
-}
+]
 
 
 class GraphSampleCollector:
@@ -184,19 +193,20 @@ def plot_device_group(
     warmup_seconds,
     duration_seconds,
 ):
-    axis_names = plot_definition["axes"]
+    axis_definitions = plot_definition["axes"]
     fig, axes = plt.subplots(
-        len(axis_names),
+        len(axis_definitions),
         1,
         sharex=True,
         figsize=plot_definition["figsize"],
     )
     for axis_index, ax in enumerate(axes):
+        axis_name, data_index = axis_definitions[axis_index]
         plotted = False
         for label, snapshot in group_items:
             x_values, y_values = make_data_series(
                 snapshot["data_samples"],
-                axis_index,
+                data_index,
                 start_time,
                 duration_seconds,
             )
@@ -211,8 +221,8 @@ def plot_device_group(
             ax.plot(x_values, y_values, linewidth=1.3, label=line_label)
             plotted = True
 
-        ax.set_title(axis_names[axis_index])
-        ax.set_ylabel(axis_names[axis_index])
+        ax.set_title(axis_name)
+        ax.set_ylabel(axis_name)
         ax.set_xlim(0, duration_seconds)
         ax.grid(True, alpha=0.3)
         if plotted:
@@ -249,11 +259,11 @@ def plot_results(
         return 1
 
     figures = []
-    for device_type, plot_definition in PLOT_DEFINITIONS.items():
+    for plot_definition in PLOT_DEFINITIONS:
         group_items = [
             (label, snapshot)
             for label, snapshot, device_config in zip(labels, snapshots, device_configs)
-            if device_config["type"] == device_type
+            if device_config["type"] == plot_definition["device_type"]
         ]
         if not group_items:
             continue
@@ -507,7 +517,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "M5Stack Core2 Bluetooth Classic IMU/重心動揺計を複数台接続し、"
-            "IMUは3グラフ、重心動揺計は4グラフに分けて表示します。"
+            "IMU加速度、IMUジャイロ、重心動揺計に分けて表示します。"
         )
     )
     parser.add_argument(
