@@ -9,7 +9,7 @@
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled! Please enable it in the ESP32 settings.
 #endif
-const char* BT_NAME_PREFIX = "M5Stack-IMU_2";
+const char* BT_NAME_PREFIX = "M5Stack-IMU_1";
 char btName[32];
 BluetoothSerial SerialBT;
 // サンプリング設定
